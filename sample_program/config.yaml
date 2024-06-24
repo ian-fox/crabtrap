@@ -1,0 +1,4 @@
+shared_objects:
+  "/usr/local/lib/libprintf_wrapper.so":
+    block:
+    - 64 # write

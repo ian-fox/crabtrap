@@ -1,15 +1,17 @@
-pub use config::{Config, ConfigEntry};
+pub use config::{Check, Config, ConfigEntry};
+pub use map::MemoryMap;
 use nix::{
     sys::{
-        ptrace::{getregs, read, setoptions, syscall, traceme, AddressType, Options},
+        ptrace::{getregs, kill, read, setoptions, syscall, traceme, AddressType, Options},
         wait::{waitpid, WaitStatus},
     },
     unistd::{execve, fork, ForkResult, Pid},
 };
 use serde::{Deserialize, Serialize};
-use std::ffi::CStr;
+use std::{collections::BTreeSet, ffi::CStr};
 use syscalls::Sysno;
 mod config;
+mod map;
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub enum ChildExit {
@@ -27,22 +29,39 @@ fn child(path: &CStr, args: &[&CStr], env: &[&CStr]) -> ! {
     unreachable!();
 }
 
-/// handle_syscall walks up the stack to see where a syscall came from.
+/// handle_syscall walks up the stack to see where a syscall came from, and returns an IllegalSyscall if it should be blocked.
 ///
 /// Reference: https://github.com/ARM-software/abi-aa/blob/2a70c42d62e9c3eb5887fa50b71257f20daca6f9/aapcs64/aapcs64.rst#646the-frame-pointer
-fn handle_syscall(pid: Pid, _config: &Config) {
+fn handle_syscall(pid: Pid, config: &Config, map: &mut MemoryMap) -> Option<ChildExit> {
     let regs = getregs(pid).expect("failed to get registers");
     let syscall = Sysno::from(regs.regs[8] as u32);
 
-    println!("Syscall: {syscall}");
+    // I don't have an exhaustive knowledge of which syscalls might affect memory.
+    // For a real project I'd do more research or set up some tests to see if I'd missed any.
+    if BTreeSet::from([
+        Sysno::execve,
+        Sysno::execveat,
+        Sysno::clone,
+        Sysno::mmap,
+        Sysno::munmap,
+        Sysno::mremap,
+    ])
+    .contains(&syscall)
+    {
+        *map = MemoryMap::from_pid(pid).unwrap();
+    }
+
+    for addr in [regs.pc, regs.regs[30]] {
+        if let Some(loc) = map.lookup(addr) {
+            match config.check(loc, syscall) {
+                Check::Allowed => return None,
+                Check::Blocked => return Some(ChildExit::IllegalSyscall(syscall, loc.to_string())),
+                Check::Unknown => {}
+            }
+        }
+    }
 
     let mut frame_pointer: u64 = regs.regs[29];
-    println!(
-        "Initial pc: {pc:x}, lr: {lr:x}, fp: {frame_pointer:x}",
-        pc = regs.pc,
-        lr = regs.regs[30]
-    );
-
     let mut saved_lr;
     loop {
         if frame_pointer == 0 {
@@ -52,13 +71,19 @@ fn handle_syscall(pid: Pid, _config: &Config) {
         saved_lr =
             read(pid, (frame_pointer + 8) as AddressType).expect("failed to read saved lr") as u64;
 
-        println!("saved_lr: {saved_lr:x}, frame pointer: {frame_pointer:x}");
+        if let Some(loc) = map.lookup(saved_lr) {
+            match config.check(loc, syscall) {
+                Check::Allowed => return None,
+                Check::Blocked => return Some(ChildExit::IllegalSyscall(syscall, loc.to_string())),
+                Check::Unknown => {}
+            }
+        }
 
         frame_pointer =
             read(pid, frame_pointer as AddressType).expect("failed to read frame pointer") as u64;
     }
 
-    println!("Bottom of stack.");
+    None
 }
 
 /// parent attaches to the child with ptrace and then watches for syscalls in a loop
@@ -74,6 +99,8 @@ fn parent(child: Pid, config: &Config) -> ChildExit {
     )
     .expect("failed to set ptrace options");
 
+    let mut memory_map = MemoryMap::from_pid(child).unwrap();
+
     println!("Starting to watch child...");
     loop {
         syscall(child, None).expect("failed to restart child");
@@ -82,7 +109,10 @@ fn parent(child: Pid, config: &Config) -> ChildExit {
                 return ChildExit::Exited(code);
             }
             WaitStatus::PtraceSyscall(pid) => {
-                handle_syscall(pid, config);
+                if let Some(exit) = handle_syscall(pid, config, &mut memory_map) {
+                    kill(pid).expect("failed to kill child");
+                    return exit;
+                }
             }
             status => panic!("unexpected child process status {status:?}"),
         }

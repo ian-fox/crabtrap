@@ -23,6 +23,6 @@ COPY --from=base /crabtrap_test/static \
     /usr/local/bin/
 
 WORKDIR /crabtrap
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock sample_program/config.yaml ./
 COPY src src
 COPY tests tests

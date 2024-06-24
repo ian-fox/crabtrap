@@ -1,7 +1,7 @@
 pub use config::{Config, ConfigEntry};
 use nix::{
     sys::{
-        ptrace::{setoptions, syscall, traceme, Options},
+        ptrace::{getregs, read, setoptions, syscall, traceme, AddressType, Options},
         wait::{waitpid, WaitStatus},
     },
     unistd::{execve, fork, ForkResult, Pid},
@@ -27,8 +27,42 @@ fn child(path: &CStr, args: &[&CStr], env: &[&CStr]) -> ! {
     unreachable!();
 }
 
+/// handle_syscall walks up the stack to see where a syscall came from.
+///
+/// Reference: https://github.com/ARM-software/abi-aa/blob/2a70c42d62e9c3eb5887fa50b71257f20daca6f9/aapcs64/aapcs64.rst#646the-frame-pointer
+fn handle_syscall(pid: Pid, _config: &Config) {
+    let regs = getregs(pid).expect("failed to get registers");
+    let syscall = Sysno::from(regs.regs[8] as u32);
+
+    println!("Syscall: {syscall}");
+
+    let mut frame_pointer: u64 = regs.regs[29];
+    println!(
+        "Initial pc: {pc:x}, lr: {lr:x}, fp: {frame_pointer:x}",
+        pc = regs.pc,
+        lr = regs.regs[30]
+    );
+
+    let mut saved_lr;
+    loop {
+        if frame_pointer == 0 {
+            break;
+        }
+
+        saved_lr =
+            read(pid, (frame_pointer + 8) as AddressType).expect("failed to read saved lr") as u64;
+
+        println!("saved_lr: {saved_lr:x}, frame pointer: {frame_pointer:x}");
+
+        frame_pointer =
+            read(pid, frame_pointer as AddressType).expect("failed to read frame pointer") as u64;
+    }
+
+    println!("Bottom of stack.");
+}
+
 /// parent attaches to the child with ptrace and then watches for syscalls in a loop
-fn parent(child: Pid, _config: &Config) -> ChildExit {
+fn parent(child: Pid, config: &Config) -> ChildExit {
     println!("Continuing execution in parent process, new child has pid: {child}");
 
     // Wait for the stop from the first exec
@@ -47,8 +81,8 @@ fn parent(child: Pid, _config: &Config) -> ChildExit {
             WaitStatus::Exited(_, code) => {
                 return ChildExit::Exited(code);
             }
-            WaitStatus::PtraceSyscall(_pid) => {
-                // This is where the syscall handling logic will go.
+            WaitStatus::PtraceSyscall(pid) => {
+                handle_syscall(pid, config);
             }
             status => panic!("unexpected child process status {status:?}"),
         }

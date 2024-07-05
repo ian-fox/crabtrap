@@ -57,4 +57,10 @@ impl Config {
             .expect("failed to read file");
         serde_yaml::from_str(&contents).expect("failed to parse config file")
     }
+
+    pub fn new() -> Config {
+        Config {
+            shared_objects: BTreeMap::new(),
+        }
+    }
 }

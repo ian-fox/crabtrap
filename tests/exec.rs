@@ -42,3 +42,45 @@ fn test_blocked() {
         );
     }
 }
+
+#[test]
+fn test_child_ok() {
+    assert_eq!(
+        crabtrap::execute(
+            &CString::new(format!("/usr/local/bin/child")).unwrap(),
+            &[],
+            &[&CString::new("LD_LIBRARY_PATH=/usr/local/lib").unwrap()],
+            &Config {
+                shared_objects: BTreeMap::from([(
+                    "/usr/local/lib/libprintf_wrapper.so".into(),
+                    ConfigEntry {
+                        allow: None,
+                        block: Some(BTreeSet::from([Sysno::write])),
+                    }
+                )]),
+            },
+        ),
+        ChildExit::Exited(0),
+    );
+}
+
+#[test]
+fn test_child_blocked() {
+    assert_eq!(
+        crabtrap::execute(
+            &CString::new(format!("/usr/local/bin/child")).unwrap(),
+            &[],
+            &[&CString::new("LD_LIBRARY_PATH=/usr/local/lib").unwrap()],
+            &Config {
+                shared_objects: BTreeMap::from([(
+                    "/usr/local/lib/libprintf_wrapper.so".into(),
+                    ConfigEntry {
+                        allow: None,
+                        block: Some(BTreeSet::from([Sysno::write])),
+                    }
+                )]),
+            },
+        ),
+        ChildExit::IllegalSyscall(Sysno::write, "/usr/local/lib/libprintf_wrapper.so".into()),
+    );
+}

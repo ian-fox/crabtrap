@@ -1,17 +1,40 @@
 pub use config::{Check, Config, ConfigEntry};
 pub use map::MemoryMap;
 use nix::{
+    errno::Errno,
+    libc::c_int,
     sys::{
-        ptrace::{getregs, kill, read, setoptions, syscall, traceme, AddressType, Options},
+        ptrace::{
+            getevent, getregs, kill, read, setoptions, syscall, traceme, AddressType, Event,
+            Options,
+        },
+        signal::Signal,
         wait::{waitpid, WaitStatus},
     },
     unistd::{execve, fork, ForkResult, Pid},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, ffi::CStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::CStr,
+};
 use syscalls::Sysno;
 mod config;
 mod map;
+
+fn event_from_int(event: i32) -> Event {
+    match event {
+        1 => Event::PTRACE_EVENT_FORK,
+        2 => Event::PTRACE_EVENT_VFORK,
+        3 => Event::PTRACE_EVENT_CLONE,
+        4 => Event::PTRACE_EVENT_EXEC,
+        5 => Event::PTRACE_EVENT_VFORK_DONE,
+        6 => Event::PTRACE_EVENT_EXIT,
+        7 => Event::PTRACE_EVENT_SECCOMP,
+        128 => Event::PTRACE_EVENT_STOP,
+        e => panic!("Unknown ptrace event {e}"),
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub enum ChildExit {
@@ -95,26 +118,95 @@ fn parent(child: Pid, config: &Config) -> ChildExit {
 
     setoptions(
         child,
-        Options::PTRACE_O_EXITKILL.union(Options::PTRACE_O_TRACESYSGOOD),
+        Options::PTRACE_O_EXITKILL
+            .union(Options::PTRACE_O_TRACESYSGOOD)
+            .union(Options::PTRACE_O_TRACEFORK)
+            .union(Options::PTRACE_O_TRACECLONE)
+            .union(Options::PTRACE_O_TRACEVFORK)
+            .union(Options::PTRACE_O_TRACEEXEC),
     )
     .expect("failed to set ptrace options");
 
-    let mut memory_map = MemoryMap::from_pid(child).unwrap();
+    let mut children: BTreeMap<Pid, Box<MemoryMap>> =
+        BTreeMap::from([(child, Box::new(MemoryMap::from_pid(child).unwrap()))]);
+    let mut ignore_next_stop: BTreeSet<Pid> = BTreeSet::new();
+    let mut child_exit = None;
 
     println!("Starting to watch child...");
+    syscall(child, None).expect("failed to start child");
+
     loop {
-        syscall(child, None).expect("failed to restart child");
-        match waitpid(child, None).expect("failed to get status from waitpid") {
-            WaitStatus::Exited(_, code) => {
-                return ChildExit::Exited(code);
+        match waitpid(None, None) {
+            Err(Errno::ECHILD) => {
+                return ChildExit::Exited(
+                    child_exit.unwrap_or_else(|| panic!("unknown exit status for child {child}")),
+                )
             }
-            WaitStatus::PtraceSyscall(pid) => {
-                if let Some(exit) = handle_syscall(pid, config, &mut memory_map) {
-                    kill(pid).expect("failed to kill child");
-                    return exit;
+            Ok(WaitStatus::Exited(pid, code)) => {
+                if pid == child {
+                    child_exit = Some(code);
                 }
             }
-            status => panic!("unexpected child process status {status:?}"),
+            Ok(WaitStatus::PtraceSyscall(pid)) => {
+                let child_mem: &mut MemoryMap = children
+                    .entry(pid)
+                    .or_insert(Box::new(MemoryMap::from_pid(pid).unwrap_or_else(|e| {
+                        panic!("Couldn't build map for {}: {}", pid, e)
+                    })));
+
+                if let Some(exit) = handle_syscall(pid, config, child_mem) {
+                    kill(pid).unwrap_or_else(|e| panic!("failed to kill child {pid}: {e}"));
+                    return exit;
+                }
+                syscall(pid, None)
+                    .unwrap_or_else(|e| panic!("failed to restart child {pid} after syscall: {e}"));
+            }
+            Ok(WaitStatus::Stopped(pid, signal)) => {
+                if signal == Signal::SIGSTOP && ignore_next_stop.contains(&pid) {
+                    ignore_next_stop.remove(&pid);
+                    syscall(pid, None).unwrap_or_else(|e| {
+                        panic!("failed to restart child {pid} after suppressing SIGSTOP: {e}")
+                    });
+                    continue;
+                }
+
+                syscall(pid, signal).unwrap_or_else(|e| {
+                    panic!("failed to restart child {pid} after signal {signal}: {e}")
+                });
+            }
+            Ok(WaitStatus::PtraceEvent(pid, _, event))
+                if event == Event::PTRACE_EVENT_EXEC as c_int =>
+            {
+                syscall(pid, None).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to restart child {pid} after event {:?}: {e}",
+                        event_from_int(event)
+                    );
+                });
+            }
+            Ok(WaitStatus::PtraceEvent(pid, _, event))
+                if event == Event::PTRACE_EVENT_FORK as c_int
+                    || event == Event::PTRACE_EVENT_VFORK as c_int
+                    || event == Event::PTRACE_EVENT_CLONE as c_int =>
+            {
+                let new_child_pid = Pid::from_raw(
+                    getevent(pid)
+                        .unwrap_or_else(|e| panic!("failed to get new child of {pid}: {e}"))
+                        .try_into()
+                        .unwrap(),
+                );
+                if !ignore_next_stop.insert(new_child_pid) {
+                    panic!("new child {new_child_pid} already in list to ignore next SIGSTOP");
+                }
+                syscall(pid, None).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to restart child {pid} after event {:?}: {e}",
+                        event_from_int(event)
+                    );
+                });
+            }
+            Ok(status) => panic!("unexpected child process status {status:?}"),
+            Err(errno) => panic!("error from waitpid: {errno}"),
         }
     }
 }
